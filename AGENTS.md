@@ -203,9 +203,9 @@ channel and exit nonzero on any failure:
 | `handy model download <id>` | Download a transcription model (blocks until done; see `--list-models`) |
 
 **Implementation:** `control.rs` (channel + client + server), `cli.rs`
-(subcommand definitions), `main.rs` (`run_cli_control` routes and exits before
-booting Tauri), `lib.rs` (`control::start` launches the listener in
-`initialize_core_logic`).
+(subcommand definitions), `lib.rs` (`run_cli_control` routes the subcommand;
+`control::start` launches the listener in `initialize_core_logic`), `main.rs`
+(calls `run_cli_control` and exits before booting Tauri).
 
 **Key design decisions:**
 

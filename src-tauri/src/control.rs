@@ -141,7 +141,13 @@ pub fn start(app: AppHandle) {
         }
     };
 
-    let token = generate_token();
+    let token = match generate_token() {
+        Ok(t) => t,
+        Err(e) => {
+            error!("CLI control: failed to generate token: {e}");
+            return;
+        }
+    };
     if let Err(e) = write_control_file(port, &token) {
         error!("CLI control: failed to write control file: {e}");
         return;
@@ -181,12 +187,16 @@ fn handle_connection(stream: TcpStream, app: &AppHandle, token: &str) -> std::io
     // timeout, and the response write is unaffected.
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
 
-    let mut reader = BufReader::new(stream.try_clone()?);
+    // Requests are a single short JSON line; cap the read so a client cannot
+    // stream unbounded data without a newline and pin memory on this thread.
+    use std::io::Read;
+    const MAX_REQUEST_BYTES: u64 = 64 * 1024;
+    let mut reader = BufReader::new(stream.try_clone()?.take(MAX_REQUEST_BYTES));
     let mut line = String::new();
     reader.read_line(&mut line)?;
 
     let response = match serde_json::from_str::<Request>(line.trim()) {
-        Ok(req) if req.token == token => match dispatch(app, req.command) {
+        Ok(req) if tokens_match(&req.token, token) => match dispatch(app, req.command) {
             Ok(message) => Response {
                 ok: true,
                 message: Some(message),
@@ -251,6 +261,13 @@ fn dispatch(app: &AppHandle, command: ControlCommand) -> Result<String, String> 
             Ok(message.to_string())
         }
         ControlCommand::SetMicrophone { name } => {
+            // Resolve the manager before touching persisted settings so a missing
+            // manager never leaves a device selection that was never applied.
+            let rm = app
+                .try_state::<Arc<AudioRecordingManager>>()
+                .ok_or_else(|| "audio manager not initialized".to_string())?;
+
+            let previous = get_settings(app).selected_microphone.clone();
             let mut settings = get_settings(app);
             settings.selected_microphone = if name == "default" {
                 None
@@ -261,11 +278,13 @@ fn dispatch(app: &AppHandle, command: ControlCommand) -> Result<String, String> 
 
             // Apply live: update_selected_device restarts the cpal stream. We are
             // on a dedicated connection thread, so this blocking call is fine.
-            let rm = app
-                .try_state::<Arc<AudioRecordingManager>>()
-                .ok_or_else(|| "audio manager not initialized".to_string())?;
-            rm.update_selected_device()
-                .map_err(|e| format!("failed to apply device: {e}"))?;
+            if let Err(e) = rm.update_selected_device() {
+                // Roll back so a failed apply does not survive a restart.
+                let mut restored = get_settings(app);
+                restored.selected_microphone = previous;
+                write_settings(app, restored);
+                return Err(format!("failed to apply device: {e}"));
+            }
 
             Ok(format!("microphone set to \"{name}\""))
         }
@@ -301,12 +320,24 @@ fn write_control_file(port: u16, token: &str) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let json = serde_json::json!({ "port": port, "token": token }).to_string();
-    std::fs::write(&path, json)?;
     #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Create with 0600 from the outset so the token is never briefly
+        // world-readable between the write and a follow-up chmod.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)?;
+        file.write_all(json.as_bytes())?;
+        // An existing file keeps its old mode through OpenOptions, so enforce it.
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     }
+    #[cfg(not(unix))]
+    std::fs::write(&path, json)?;
     Ok(())
 }
 
@@ -329,25 +360,22 @@ fn read_control_file() -> Result<(u16, String), String> {
     Ok((port, token))
 }
 
-/// Generate a per-launch token. Not cryptographic — just enough entropy to keep
-/// an unrelated local process from stumbling onto the loopback port. The token
-/// lives in a 0600 file readable only by the user.
-fn generate_token() -> String {
-    use sha2::{Digest, Sha256};
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id() as u128;
-    let stack_marker = &nanos as *const _ as u128;
+/// Generate a per-launch token from the OS CSPRNG (16 random bytes, hex-encoded
+/// to 32 chars). The token lives in a 0600 file readable only by the user and
+/// gates the loopback socket. Fails loudly if the CSPRNG is unavailable rather
+/// than falling back to predictable entropy.
+fn generate_token() -> std::io::Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(std::io::Error::other)?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
 
-    let mut hasher = Sha256::new();
-    hasher.update(nanos.to_le_bytes());
-    hasher.update(pid.to_le_bytes());
-    hasher.update(stack_marker.to_le_bytes());
-    let digest = hasher.finalize();
-
-    digest[..16].iter().map(|b| format!("{b:02x}")).collect()
+/// Constant-time token comparison so a timing side channel cannot be used to
+/// recover the token byte by byte. `ct_eq` on slices already returns false for
+/// mismatched lengths.
+fn tokens_match(received: &str, expected: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    received.as_bytes().ct_eq(expected.as_bytes()).into()
 }
 
 // ---------------------------------------------------------------------------
@@ -538,9 +566,17 @@ mod tests {
 
     #[test]
     fn token_is_16_bytes_of_hex() {
-        let token = generate_token();
+        let token = generate_token().unwrap();
         assert_eq!(token.len(), 32);
         assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn tokens_match_is_true_only_on_equal_tokens() {
+        let token = generate_token().unwrap();
+        assert!(tokens_match(&token, &token));
+        assert!(!tokens_match(&token, "0"));
+        assert!(!tokens_match(&token, &format!("{token}extra")));
     }
 
     /// End-to-end wire test over a real loopback socket: a mock server reads the
@@ -580,9 +616,15 @@ mod tests {
 
     #[test]
     fn send_request_errors_when_nothing_listening() {
-        // Port 1 on loopback has nothing bound; connect must fail as transport.
+        // Bind an ephemeral port, record it, then drop the listener so nothing is
+        // bound there — deterministic even in a sandbox where low ports may be in
+        // use. connect must then fail as a transport error.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
         let err = send_request(
-            1,
+            port,
             "t".to_string(),
             &ControlCommand::Listen {
                 state: ListenState::Off,
