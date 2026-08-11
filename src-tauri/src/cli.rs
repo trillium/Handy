@@ -1,9 +1,54 @@
-use clap::Parser;
+use crate::control::ListenState;
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+
+/// Subcommands that drive a *running* Handy instance over the local CLI control
+/// channel (see `control.rs`). Unlike the top-level flags below (which the app
+/// consumes at its own startup or forwards via single-instance), these run as a
+/// short-lived process that connects to the running app, applies the change
+/// live, and reports the acknowledged result — exiting nonzero on any failure.
+#[derive(Subcommand, Debug, Clone)]
+pub enum Command {
+    /// Turn microphone listening on/off (or toggle) on the running app.
+    Listen {
+        /// Desired state: `on`, `off`, or `toggle`.
+        #[arg(value_enum)]
+        state: ListenState,
+    },
+    /// Change the active input device on the running app.
+    ///
+    /// Matches the device by exact name, or by a unique case-insensitive
+    /// substring. If the query matches more than one device, every candidate is
+    /// printed and the command exits nonzero rather than guessing. Pass
+    /// `default` to follow the system default.
+    Mic {
+        /// Device name or a unique substring (or `default`).
+        device: String,
+    },
+    /// Transcription model operations.
+    Model {
+        #[command(subcommand)]
+        action: ModelCommand,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum ModelCommand {
+    /// Download a transcription model by id (see `handy --list-models`).
+    Download {
+        /// Model id, e.g. `whisper-small`.
+        name: String,
+    },
+}
 
 #[derive(Parser, Debug, Clone, Default)]
 #[command(name = "handy", about = "Handy - Speech to Text")]
 pub struct CliArgs {
+    /// Drive a running Handy instance (listen / mic / model). Omit to launch
+    /// the app normally.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Start with the main window hidden
     #[arg(long)]
     pub start_hidden: bool,

@@ -190,6 +190,38 @@ Handy supports command-line parameters on all platforms for integration with scr
 - Remote control flags work via `tauri_plugin_single_instance`: second instance sends args, then exits
 - `send_transcription_input()` in `signal_handle.rs` is shared between signal handlers and CLI
 
+### CLI control subcommands (drive a running instance, with acknowledgment)
+
+For actions that need a success/failure result back (not just fire-and-forget),
+Handy exposes subcommands that talk to the running app over a local control
+channel and exit nonzero on any failure:
+
+| Subcommand                | Description                                                          |
+| ------------------------- | ------------------------------------------------------------------- |
+| `handy listen on\|off\|toggle` | Turn microphone listening on/off (or flip it) on the running app |
+| `handy mic <device>`      | Select the active input device by exact name or a unique substring  |
+| `handy model download <id>` | Download a transcription model (blocks until done; see `--list-models`) |
+
+**Implementation:** `control.rs` (channel + client + server), `cli.rs`
+(subcommand definitions), `main.rs` (`run_cli_control` routes and exits before
+booting Tauri), `lib.rs` (`control::start` launches the listener in
+`initialize_core_logic`).
+
+**Key design decisions:**
+
+- The running app listens on a loopback (`127.0.0.1`) TCP socket on an ephemeral
+  port; the port + a per-launch token are written to `cli-control.json` in the
+  app data dir (portable-aware, 0600 on unix). The CLI client reads that file,
+  connects, sends one JSON line, and reads one JSON line back.
+- Chosen over single-instance arg-forwarding because that path is one-way and
+  cannot acknowledge — the CLI must only report success after the app actually
+  applied the change (e.g. `model download` must surface a failed download).
+- `mic <device>` resolves the device **client-side** and requires exactly one
+  match; on zero or multiple matches it prints every candidate (name + index) to
+  stderr and exits nonzero rather than guessing.
+- Exit codes: `0` ok, `1` command failed (app reached), `2` bad usage / mic
+  ambiguity, `3` app not reachable.
+
 ## Debug Mode
 
 Access debug features: `Cmd+Shift+D` (macOS) or `Ctrl+Shift+D` (Windows/Linux)
@@ -215,3 +247,10 @@ See the [Troubleshooting](README.md#troubleshooting) section in README.md.
 - **Full contributor workflow:** [CONTRIBUTING.md](CONTRIBUTING.md).
 
 **Commits:** Use conventional commit prefixes (`feat:`, `fix:`, `docs:`, `refactor:`, `chore:`). Focus the message on _why_, not _what_.
+
+## Maintaining this file
+
+Keep this file for knowledge useful to almost every future agent session in this project.
+Do not repeat what the codebase already shows; point to the authoritative file or command instead.
+Prefer rewriting or pruning existing entries over appending new ones.
+When updating this file, preserve this bar for all agents and keep entries concise.

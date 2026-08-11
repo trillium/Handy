@@ -8,6 +8,7 @@ mod catalog;
 pub mod cli;
 mod clipboard;
 mod commands;
+mod control;
 mod helpers;
 mod input;
 mod llm_client;
@@ -26,6 +27,8 @@ mod tray_i18n;
 mod utils;
 
 pub use cli::CliArgs;
+use cli::{Command, ModelCommand};
+use control::ControlCommand;
 #[cfg(debug_assertions)]
 use specta_typescript::{BigIntExportBehavior, Typescript};
 use tauri_specta::{collect_commands, collect_events, Builder};
@@ -335,6 +338,11 @@ fn initialize_core_logic(app_handle: &AppHandle) {
 
     // Create the recording overlay window (hidden by default)
     utils::create_recording_overlay(app_handle);
+
+    // Start the local CLI control channel so `handy listen|mic|model ...` can
+    // drive this running instance. Best-effort — a bind failure is logged and
+    // the app continues normally.
+    control::start(app_handle.clone());
 }
 
 #[tauri::command]
@@ -584,6 +592,22 @@ fn run_headless_transcription(app: &AppHandle, args: &CliArgs) -> i32 {
         println!("text: {}", text);
     }
     0
+}
+
+/// Handle a CLI control subcommand (`handy listen|mic|model ...`) by talking to
+/// an already-running instance over the local control channel. Returns
+/// `Some(exit_code)` when a subcommand was present (the caller should exit with
+/// that code without booting the app), or `None` for a normal launch.
+pub fn run_cli_control(cli_args: &CliArgs) -> Option<i32> {
+    let command = cli_args.command.as_ref()?;
+    let code = match command {
+        Command::Listen { state } => control::run(&ControlCommand::Listen { state: *state }),
+        Command::Mic { device } => control::run_mic(device),
+        Command::Model {
+            action: ModelCommand::Download { name },
+        } => control::run(&ControlCommand::DownloadModel { id: name.clone() }),
+    };
+    Some(code)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1002,6 +1026,9 @@ pub fn run(cli_args: CliArgs) {
                 if let Some(tm) = app.try_state::<Arc<TranscriptionManager>>() {
                     let _ = tm.unload_model();
                 }
+                // Drop the CLI control file so the next launch does not inherit a
+                // stale port.
+                control::remove_control_file();
             }
             _ => {}
         });
