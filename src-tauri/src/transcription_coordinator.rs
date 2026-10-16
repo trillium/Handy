@@ -1,6 +1,7 @@
 use crate::actions::ACTION_MAP;
 use crate::managers::audio::AudioRecordingManager;
 use log::{debug, error, warn};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -44,6 +45,52 @@ enum Stage {
     Processing,
 }
 
+/// Externally visible pipeline stage (the coordinator's private `Stage`
+/// without the binding payload). Readable from any thread via
+/// [`TranscriptionCoordinator::stage`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineStage {
+    Idle,
+    Recording,
+    Processing,
+}
+
+impl PipelineStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PipelineStage::Idle => "idle",
+            PipelineStage::Recording => "recording",
+            PipelineStage::Processing => "processing",
+        }
+    }
+
+    fn to_u8(self) -> u8 {
+        match self {
+            PipelineStage::Idle => 0,
+            PipelineStage::Recording => 1,
+            PipelineStage::Processing => 2,
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => PipelineStage::Recording,
+            2 => PipelineStage::Processing,
+            _ => PipelineStage::Idle,
+        }
+    }
+}
+
+impl From<&Stage> for PipelineStage {
+    fn from(stage: &Stage) -> Self {
+        match stage {
+            Stage::Idle => PipelineStage::Idle,
+            Stage::Recording(_) => PipelineStage::Recording,
+            Stage::Processing => PipelineStage::Processing,
+        }
+    }
+}
+
 fn classify_ptt_event(
     pending_release_binding: Option<&str>,
     is_pressed: bool,
@@ -73,6 +120,8 @@ fn classify_ptt_event(
 /// the async transcribe-paste pipeline.
 pub struct TranscriptionCoordinator {
     tx: Sender<Command>,
+    /// Mirror of the coordinator thread's `Stage`, for lock-free reads.
+    stage: Arc<AtomicU8>,
 }
 
 pub fn is_transcribe_binding(id: &str) -> bool {
@@ -82,14 +131,26 @@ pub fn is_transcribe_binding(id: &str) -> bool {
 impl TranscriptionCoordinator {
     pub fn new(app: AppHandle) -> Self {
         let (tx, rx) = mpsc::channel();
+        let shared_stage = Arc::new(AtomicU8::new(PipelineStage::Idle.to_u8()));
+        let published_stage = Arc::clone(&shared_stage);
 
         thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut stage = Stage::Idle;
                 let mut last_press: Option<Instant> = None;
                 let mut pending_release: Option<PendingRelease> = None;
+                let mut published = PipelineStage::Idle;
 
                 loop {
+                    // Publish any stage change made by the previous iteration
+                    // (every path, including `continue`, returns here).
+                    let current = PipelineStage::from(&stage);
+                    if current != published {
+                        published_stage.store(current.to_u8(), Ordering::SeqCst);
+                        crate::control::publish_stage_change(current);
+                        published = current;
+                    }
+
                     let cmd = if let Some(pending) = &pending_release {
                         match rx.recv_timeout(
                             pending.deadline.saturating_duration_since(Instant::now()),
@@ -211,7 +272,15 @@ impl TranscriptionCoordinator {
             }
         });
 
-        Self { tx }
+        Self {
+            tx,
+            stage: shared_stage,
+        }
+    }
+
+    /// Current pipeline stage as last published by the coordinator thread.
+    pub fn stage(&self) -> PipelineStage {
+        PipelineStage::from_u8(self.stage.load(Ordering::SeqCst))
     }
 
     /// Send a keyboard/signal input event for a transcribe binding.
@@ -284,6 +353,32 @@ fn stop(app: &AppHandle, stage: &mut Stage, binding_id: &str, hotkey_string: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipeline_stage_round_trips_through_u8() {
+        for stage in [
+            PipelineStage::Idle,
+            PipelineStage::Recording,
+            PipelineStage::Processing,
+        ] {
+            assert_eq!(PipelineStage::from_u8(stage.to_u8()), stage);
+        }
+        assert_eq!(PipelineStage::from_u8(200), PipelineStage::Idle);
+    }
+
+    #[test]
+    fn pipeline_stage_maps_from_private_stage() {
+        assert_eq!(PipelineStage::from(&Stage::Idle), PipelineStage::Idle);
+        assert_eq!(
+            PipelineStage::from(&Stage::Recording("transcribe".into())),
+            PipelineStage::Recording
+        );
+        assert_eq!(
+            PipelineStage::from(&Stage::Processing),
+            PipelineStage::Processing
+        );
+        assert_eq!(PipelineStage::Processing.as_str(), "processing");
+    }
 
     #[test]
     fn push_to_talk_release_while_recording_defers_release() {

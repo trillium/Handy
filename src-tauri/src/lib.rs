@@ -601,7 +601,12 @@ fn run_headless_transcription(app: &AppHandle, args: &CliArgs) -> i32 {
 pub fn run_cli_control(cli_args: &CliArgs) -> Option<i32> {
     let command = cli_args.command.as_ref()?;
     let code = match command {
-        Command::Listen { state } => control::run(&ControlCommand::Listen { state: *state }),
+        Command::Listen { state, submit } => control::run(&ControlCommand::Listen {
+            state: *state,
+            submit: *submit,
+        }),
+        Command::Status => control::run(&ControlCommand::Status),
+        Command::Events => control::run_events(),
         Command::Mic { device } => control::run_mic(device),
         Command::Model {
             action: ModelCommand::Download { name },

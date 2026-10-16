@@ -726,6 +726,12 @@ pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
     let paste_method = settings.paste_method;
     let paste_delay_ms = settings.paste_delay_ms;
     let paste_delay_after_ms = settings.paste_delay_after_ms;
+    // A pending `listen off --submit` request forces one auto-submit after this
+    // paste, even when the global setting is off. Only consumed when something
+    // is actually pasted, so it cannot be spent on a no-op.
+    let submit_requested =
+        paste_method != PasteMethod::None && crate::control::take_submit_request();
+    let auto_submit = settings.auto_submit || submit_requested;
 
     // Append trailing space if setting is enabled
     let text = if settings.append_trailing_space {
@@ -766,7 +772,7 @@ pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
                         &app_handle,
                         &paste_method,
                         enigo,
-                        settings.auto_submit,
+                        auto_submit,
                         settings.auto_submit_key,
                         settings.clipboard_handling,
                     )
@@ -796,7 +802,7 @@ pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
         }
     }
 
-    if should_send_auto_submit(settings.auto_submit, paste_method) {
+    if should_send_auto_submit(auto_submit, paste_method) {
         std::thread::sleep(Duration::from_millis(50));
         if let Err(error) = with_enigo(&app_handle, |enigo| {
             send_return_key(enigo, settings.auto_submit_key)

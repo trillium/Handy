@@ -14,7 +14,20 @@ pub enum Command {
         /// Desired state: `on`, `off`, or `toggle`.
         #[arg(value_enum)]
         state: ListenState,
+        /// When stopping, wait for the transcription to be pasted and then
+        /// send the auto-submit key (Enter by default), even if the
+        /// `auto_submit` setting is off. Errors unless a recording is running.
+        #[arg(long)]
+        submit: bool,
     },
+    /// Print `{listening, stage, mic}` for the running app as one JSON line.
+    Status,
+    /// Stream state-change events (one JSON line each) until interrupted.
+    ///
+    /// Events: recording-started, recording-stopped, processing, pasted, idle
+    /// (plus a `ping` keepalive). The first line acknowledges with the
+    /// current status.
+    Events,
     /// Change the active input device on the running app.
     ///
     /// Matches the device by exact name, or by a unique case-insensitive
@@ -44,7 +57,7 @@ pub enum ModelCommand {
 #[derive(Parser, Debug, Clone, Default)]
 #[command(name = "handy", about = "Handy - Speech to Text")]
 pub struct CliArgs {
-    /// Drive a running Handy instance (listen / mic / model). Omit to launch
+    /// Drive a running Handy instance (listen / status / events / mic / model). Omit to launch
     /// the app normally.
     #[command(subcommand)]
     pub command: Option<Command>,

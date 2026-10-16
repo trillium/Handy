@@ -199,6 +199,9 @@ channel and exit nonzero on any failure:
 | Subcommand                | Description                                                          |
 | ------------------------- | ------------------------------------------------------------------- |
 | `handy listen on\|off\|toggle` | Turn microphone listening on/off (or flip it) on the running app |
+| `handy listen off --submit` | Stop, wait for the paste, then send `auto_submit_key` (even if `auto_submit` is off); errors unless a recording is running |
+| `handy status`            | Print `{listening, stage, mic}` as one JSON line (`stage`: idle/recording/processing; `mic`: null = system default) |
+| `handy events`            | Stream state-change JSON lines (`recording-started`, `recording-stopped`, `processing`, `pasted`, `idle`, `ping` keepalive) until interrupted |
 | `handy mic <device>`      | Select the active input device by exact name or a unique substring  |
 | `handy model download <id>` | Download a transcription model (blocks until done; see `--list-models`) |
 
@@ -219,6 +222,8 @@ channel and exit nonzero on any failure:
 - `mic <device>` resolves the device **client-side** and requires exactly one
   match; on zero or multiple matches it prints every candidate (name + index) to
   stderr and exits nonzero rather than guessing.
+- Wire protocol: requests are `{token, action, ...}` (`listen` takes optional `submit`, `status`, `subscribe`); replies are `{ok, message?, error?, data?}`. `subscribe` replies once with the status, then streams `{event, stage, ts}` lines until the client disconnects. Events are published from the coordinator's stage changes (`transcription_coordinator.rs`) and `publish_pasted()` in `actions.rs`; the transcribe pipeline stays in `processing` until the paste has run, so `idle` always follows `pasted`.
+- `--submit` arms a one-shot request that `clipboard::paste` consumes (never spent on `paste_method=none`); `control.rs` clears it if nothing was pasted so it cannot leak into the next dictation.
 - Exit codes: `0` ok, `1` command failed (app reached), `2` bad usage / mic
   ambiguity, `3` app not reachable.
 
