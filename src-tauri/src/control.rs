@@ -185,28 +185,54 @@ pub(crate) fn take_submit_request() -> bool {
     SUBMIT_REQUESTED.swap(false, Ordering::SeqCst)
 }
 
+/// What actually happened to a requested submit, recorded by `clipboard::paste`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SubmitOutcome {
+    /// Paste finished and the submit key was sent.
+    Sent,
+    /// Reliable paste accepted the paste and will send the submit key itself.
+    Queued,
+    PasteFailed(String),
+    SendFailed(String),
+}
+
+static SUBMIT_OUTCOME: Mutex<Option<SubmitOutcome>> = Mutex::new(None);
+
+/// Record the outcome of a requested submit; the first one recorded wins.
+pub(crate) fn record_submit_outcome(outcome: SubmitOutcome) {
+    if let Ok(mut slot) = SUBMIT_OUTCOME.lock() {
+        slot.get_or_insert(outcome);
+    }
+}
+
 /// How long to wait for the stop to take effect, and for the whole
 /// stop -> transcribe -> paste pipeline to finish.
 const SUBMIT_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const SUBMIT_PIPELINE_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Wait for a requested stop to run through the pipeline and report whether the
-/// pending submit was consumed by a paste. Always clears `pending`, so a stop
-/// that produced nothing to paste can never leak a submit into the next
-/// dictation.
+/// Wait for a requested stop to run through the pipeline and report what the
+/// paste actually did with the submit. Always clears `pending` and `outcome`,
+/// so a stop that produced nothing to paste can never leak a submit (or a
+/// stale outcome) into the next dictation.
 fn await_submit(
     rx: &Receiver<ControlEvent>,
     pending: &AtomicBool,
+    outcome: &Mutex<Option<SubmitOutcome>>,
     stop_timeout: Duration,
     pipeline_timeout: Duration,
 ) -> Result<&'static str, String> {
     let result = wait_for_pipeline(rx, stop_timeout, pipeline_timeout);
-    let unconsumed = pending.swap(false, Ordering::SeqCst);
+    pending.store(false, Ordering::SeqCst);
+    let recorded = outcome.lock().ok().and_then(|mut slot| slot.take());
     result?;
-    if unconsumed {
-        Err("nothing was pasted, so submit was not sent".to_string())
-    } else {
-        Ok("listening stopped; pasted and submitted")
+    match recorded {
+        Some(SubmitOutcome::Sent) => Ok("listening stopped; pasted and submitted"),
+        Some(SubmitOutcome::Queued) => Ok("listening stopped; pasted, submit queued"),
+        Some(SubmitOutcome::PasteFailed(e)) => Err(format!("paste failed, submit not sent: {e}")),
+        Some(SubmitOutcome::SendFailed(e)) => {
+            Err(format!("pasted, but sending submit failed: {e}"))
+        }
+        None => Err("nothing was pasted, so submit was not sent".to_string()),
     }
 }
 
@@ -525,11 +551,15 @@ fn dispatch(app: &AppHandle, command: ControlCommand) -> Result<Reply, String> {
                 // Subscribe and arm the submit request before the stop press so
                 // neither the events nor the paste can slip past us.
                 let rx = subscribe();
+                if let Ok(mut slot) = SUBMIT_OUTCOME.lock() {
+                    *slot = None;
+                }
                 SUBMIT_REQUESTED.store(true, Ordering::SeqCst);
                 coordinator.send_input("transcribe", "CLI", true, false);
                 return await_submit(
                     &rx,
                     &SUBMIT_REQUESTED,
+                    &SUBMIT_OUTCOME,
                     SUBMIT_STOP_TIMEOUT,
                     SUBMIT_PIPELINE_TIMEOUT,
                 )
@@ -1103,21 +1133,23 @@ mod tests {
     }
 
     #[test]
-    fn submit_succeeds_when_paste_consumed_the_request() {
+    fn submit_succeeds_when_submit_key_was_sent() {
         let (tx, rx) = mpsc::channel();
         let pending = AtomicBool::new(true);
+        let outcome = Mutex::new(None);
         tx.send(ev("recording-stopped", PipelineStage::Processing))
             .unwrap();
         tx.send(ev("processing", PipelineStage::Processing))
             .unwrap();
-        // The paste path takes the request before the pipeline goes idle.
         pending.store(false, Ordering::SeqCst);
+        *outcome.lock().unwrap() = Some(SubmitOutcome::Sent);
         tx.send(ev("pasted", PipelineStage::Processing)).unwrap();
         tx.send(ev("idle", PipelineStage::Idle)).unwrap();
 
         let out = await_submit(
             &rx,
             &pending,
+            &outcome,
             Duration::from_secs(1),
             Duration::from_secs(1),
         );
@@ -1128,6 +1160,7 @@ mod tests {
     fn submit_fails_and_clears_request_when_nothing_was_pasted() {
         let (tx, rx) = mpsc::channel();
         let pending = AtomicBool::new(true);
+        let outcome = Mutex::new(None);
         tx.send(ev("recording-stopped", PipelineStage::Processing))
             .unwrap();
         tx.send(ev("idle", PipelineStage::Idle)).unwrap();
@@ -1135,6 +1168,7 @@ mod tests {
         let out = await_submit(
             &rx,
             &pending,
+            &outcome,
             Duration::from_secs(1),
             Duration::from_secs(1),
         );
@@ -1149,11 +1183,13 @@ mod tests {
     fn submit_reports_cancellation_and_clears_request() {
         let (tx, rx) = mpsc::channel();
         let pending = AtomicBool::new(true);
+        let outcome = Mutex::new(None);
         tx.send(ev("idle", PipelineStage::Idle)).unwrap();
 
         let out = await_submit(
             &rx,
             &pending,
+            &outcome,
             Duration::from_secs(1),
             Duration::from_secs(1),
         );
@@ -1165,10 +1201,12 @@ mod tests {
     fn submit_times_out_when_stop_never_happens() {
         let (_tx, rx) = mpsc::channel::<ControlEvent>();
         let pending = AtomicBool::new(true);
+        let outcome = Mutex::new(None);
 
         let out = await_submit(
             &rx,
             &pending,
+            &outcome,
             Duration::from_millis(30),
             Duration::from_millis(30),
         );
@@ -1180,17 +1218,69 @@ mod tests {
     fn submit_times_out_when_pipeline_never_finishes() {
         let (tx, rx) = mpsc::channel();
         let pending = AtomicBool::new(true);
+        let outcome = Mutex::new(None);
         tx.send(ev("recording-stopped", PipelineStage::Processing))
             .unwrap();
 
         let out = await_submit(
             &rx,
             &pending,
+            &outcome,
             Duration::from_secs(1),
             Duration::from_millis(30),
         );
         assert!(out.unwrap_err().contains("timed out"));
         assert!(!pending.load(Ordering::SeqCst));
+    }
+
+    fn run_with_outcome(o: Option<SubmitOutcome>) -> (Result<&'static str, String>, bool) {
+        let (tx, rx) = mpsc::channel();
+        let pending = AtomicBool::new(true);
+        let outcome = Mutex::new(o);
+        tx.send(ev("recording-stopped", PipelineStage::Processing))
+            .unwrap();
+        tx.send(ev("idle", PipelineStage::Idle)).unwrap();
+        let out = await_submit(
+            &rx,
+            &pending,
+            &outcome,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        let cleared = outcome.lock().unwrap().is_none();
+        (out, cleared)
+    }
+
+    #[test]
+    fn submit_errors_when_paste_failed() {
+        let (out, cleared) = run_with_outcome(Some(SubmitOutcome::PasteFailed("boom".into())));
+        let err = out.unwrap_err();
+        assert!(err.contains("paste failed") && err.contains("boom"));
+        assert!(cleared);
+    }
+
+    #[test]
+    fn submit_errors_when_enter_send_failed() {
+        let (out, cleared) = run_with_outcome(Some(SubmitOutcome::SendFailed("nokey".into())));
+        let err = out.unwrap_err();
+        assert!(err.contains("submit failed") && err.contains("nokey"));
+        assert!(cleared);
+    }
+
+    #[test]
+    fn submit_reports_queued_for_reliable_paste() {
+        let (out, _) = run_with_outcome(Some(SubmitOutcome::Queued));
+        assert_eq!(out, Ok("listening stopped; pasted, submit queued"));
+    }
+
+    #[test]
+    fn first_recorded_submit_outcome_wins() {
+        let slot = Mutex::new(None);
+        slot.lock().unwrap().get_or_insert(SubmitOutcome::Sent);
+        slot.lock()
+            .unwrap()
+            .get_or_insert(SubmitOutcome::PasteFailed("late".into()));
+        assert_eq!(*slot.lock().unwrap(), Some(SubmitOutcome::Sent));
     }
 
     #[test]

@@ -722,15 +722,28 @@ fn should_send_auto_submit(auto_submit: bool, paste_method: PasteMethod) -> bool
 }
 
 pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
+    use crate::control::{record_submit_outcome, SubmitOutcome};
+
+    let submit_requested = get_settings(&app_handle).paste_method != PasteMethod::None
+        && crate::control::take_submit_request();
+    let result = paste_inner(text, app_handle, submit_requested);
+    if submit_requested {
+        if let Err(error) = &result {
+            record_submit_outcome(SubmitOutcome::PasteFailed(error.clone()));
+        }
+    }
+    result
+}
+
+fn paste_inner(text: String, app_handle: AppHandle, submit_requested: bool) -> Result<(), String> {
+    use crate::control::{record_submit_outcome, SubmitOutcome};
+
     let settings = get_settings(&app_handle);
     let paste_method = settings.paste_method;
     let paste_delay_ms = settings.paste_delay_ms;
     let paste_delay_after_ms = settings.paste_delay_after_ms;
-    // A pending `listen off --submit` request forces one auto-submit after this
-    // paste, even when the global setting is off. Only consumed when something
-    // is actually pasted, so it cannot be spent on a no-op.
-    let submit_requested =
-        paste_method != PasteMethod::None && crate::control::take_submit_request();
+    // A `listen off --submit` request forces one auto-submit after this paste,
+    // even when the global setting is off.
     let auto_submit = settings.auto_submit || submit_requested;
 
     // Append trailing space if setting is enabled
@@ -778,7 +791,12 @@ pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
                     )
                 });
                 match reliable_result {
-                    Ok(()) => return Ok(()),
+                    Ok(()) => {
+                        if submit_requested {
+                            record_submit_outcome(SubmitOutcome::Queued);
+                        }
+                        return Ok(());
+                    }
                     Err(e) => {
                         log::warn!("Reliable paste unavailable ({e}); falling back to legacy paste")
                     }
@@ -804,10 +822,20 @@ pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
 
     if should_send_auto_submit(auto_submit, paste_method) {
         std::thread::sleep(Duration::from_millis(50));
-        if let Err(error) = with_enigo(&app_handle, |enigo| {
+        match with_enigo(&app_handle, |enigo| {
             send_return_key(enigo, settings.auto_submit_key)
         }) {
-            log::warn!("Paste succeeded, but auto-submit failed: {error}");
+            Ok(()) => {
+                if submit_requested {
+                    record_submit_outcome(SubmitOutcome::Sent);
+                }
+            }
+            Err(error) => {
+                log::warn!("Paste succeeded, but auto-submit failed: {error}");
+                if submit_requested {
+                    record_submit_outcome(SubmitOutcome::SendFailed(error.to_string()));
+                }
+            }
         }
     }
 
