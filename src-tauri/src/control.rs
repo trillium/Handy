@@ -19,14 +19,17 @@ use crate::audio_toolkit::audio::list_input_devices;
 use crate::managers::audio::AudioRecordingManager;
 use crate::managers::model::ModelManager;
 use crate::settings::{get_settings, write_settings};
+use crate::transcription_coordinator::PipelineStage;
 use crate::TranscriptionCoordinator;
 use log::{debug, error, warn};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 
 /// Tauri bundle identifier — used to locate the (non-portable) app data dir
@@ -47,12 +50,29 @@ pub enum ListenState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "kebab-case")]
 pub enum ControlCommand {
-    /// Turn microphone listening on/off (or toggle it).
-    Listen { state: ListenState },
+    /// Turn microphone listening on/off (or toggle it). With `submit`, the
+    /// stop is followed by the paste and then Handy's own auto-submit key
+    /// (even if the global `auto_submit` setting is off); the reply only comes
+    /// back once the paste has finished. `submit` is an error unless this
+    /// command actually stops a running recording.
+    Listen {
+        state: ListenState,
+        #[serde(default, skip_serializing_if = "is_false")]
+        submit: bool,
+    },
+    /// Report `{listening, stage, mic}` without changing anything.
+    Status,
+    /// Keep the connection open and stream one JSON line per state change
+    /// (see [`ControlEvent`]) until the client disconnects.
+    Subscribe,
     /// Select the active input device by its exact name ("default" clears it).
     SetMicrophone { name: String },
     /// Download a transcription model by id.
     DownloadModel { id: String },
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Serialize, Deserialize)]
@@ -69,6 +89,183 @@ struct Response {
     message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// Structured payload (e.g. the `status` object), when a command has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    data: Option<serde_json::Value>,
+}
+
+/// Successful result of a command: a human-readable line plus optional data.
+struct Reply {
+    message: String,
+    data: Option<serde_json::Value>,
+}
+
+impl Reply {
+    fn message(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            data: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// State events + one-shot submit request (shared by coordinator, actions,
+// clipboard and the control server)
+// ---------------------------------------------------------------------------
+
+/// A pipeline state change streamed to `subscribe` clients as one JSON line.
+///
+/// `event` is one of `recording-started`, `recording-stopped`, `processing`,
+/// `idle`, `pasted` (or `ping`, a keepalive that carries no state change).
+/// `stage` is the pipeline stage (`idle` | `recording` | `processing`) once the
+/// event has happened; `ts` is unix milliseconds.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ControlEvent {
+    pub event: String,
+    pub stage: String,
+    pub ts: u64,
+}
+
+impl ControlEvent {
+    fn new(event: &str, stage: PipelineStage) -> Self {
+        Self {
+            event: event.to_string(),
+            stage: stage.as_str().to_string(),
+            ts: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        }
+    }
+}
+
+static SUBSCRIBERS: Mutex<Vec<Sender<ControlEvent>>> = Mutex::new(Vec::new());
+
+/// Register a new event listener. Dropping the receiver unsubscribes it (the
+/// sender is pruned on the next publish).
+fn subscribe() -> Receiver<ControlEvent> {
+    let (tx, rx) = mpsc::channel();
+    if let Ok(mut subs) = SUBSCRIBERS.lock() {
+        subs.push(tx);
+    }
+    rx
+}
+
+fn publish(event: ControlEvent) {
+    if let Ok(mut subs) = SUBSCRIBERS.lock() {
+        subs.retain(|tx| tx.send(event.clone()).is_ok());
+    }
+}
+
+/// Called by the transcription coordinator whenever its stage changes.
+pub fn publish_stage_change(stage: PipelineStage) {
+    match stage {
+        PipelineStage::Recording => publish(ControlEvent::new("recording-started", stage)),
+        PipelineStage::Processing => {
+            publish(ControlEvent::new("recording-stopped", stage));
+            publish(ControlEvent::new("processing", stage));
+        }
+        PipelineStage::Idle => publish(ControlEvent::new("idle", stage)),
+    }
+}
+
+/// Called after a transcription has been pasted (the pipeline is still in the
+/// processing stage at that point; `idle` follows).
+pub fn publish_pasted() {
+    publish(ControlEvent::new("pasted", PipelineStage::Processing));
+}
+
+/// One-shot "send the auto-submit key after the next paste" request, set by
+/// `listen off --submit` and consumed by `clipboard::paste`.
+static SUBMIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Consume the pending submit request (true at most once per request).
+pub(crate) fn take_submit_request() -> bool {
+    SUBMIT_REQUESTED.swap(false, Ordering::SeqCst)
+}
+
+/// What actually happened to a requested submit, recorded by `clipboard::paste`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SubmitOutcome {
+    /// Paste finished and the submit key was sent.
+    Sent,
+    /// Reliable paste accepted the paste and will send the submit key itself.
+    Queued,
+    PasteFailed(String),
+    SendFailed(String),
+}
+
+static SUBMIT_OUTCOME: Mutex<Option<SubmitOutcome>> = Mutex::new(None);
+
+/// Record the outcome of a requested submit; the first one recorded wins.
+pub(crate) fn record_submit_outcome(outcome: SubmitOutcome) {
+    if let Ok(mut slot) = SUBMIT_OUTCOME.lock() {
+        slot.get_or_insert(outcome);
+    }
+}
+
+/// How long to wait for the stop to take effect, and for the whole
+/// stop -> transcribe -> paste pipeline to finish.
+const SUBMIT_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const SUBMIT_PIPELINE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Wait for a requested stop to run through the pipeline and report what the
+/// paste actually did with the submit. Always clears `pending` and `outcome`,
+/// so a stop that produced nothing to paste can never leak a submit (or a
+/// stale outcome) into the next dictation.
+fn await_submit(
+    rx: &Receiver<ControlEvent>,
+    pending: &AtomicBool,
+    outcome: &Mutex<Option<SubmitOutcome>>,
+    stop_timeout: Duration,
+    pipeline_timeout: Duration,
+) -> Result<&'static str, String> {
+    let result = wait_for_pipeline(rx, stop_timeout, pipeline_timeout);
+    pending.store(false, Ordering::SeqCst);
+    let recorded = outcome.lock().ok().and_then(|mut slot| slot.take());
+    result?;
+    match recorded {
+        Some(SubmitOutcome::Sent) => Ok("listening stopped; pasted and submitted"),
+        Some(SubmitOutcome::Queued) => Ok("listening stopped; pasted, submit queued"),
+        Some(SubmitOutcome::PasteFailed(e)) => Err(format!("paste failed, submit not sent: {e}")),
+        Some(SubmitOutcome::SendFailed(e)) => {
+            Err(format!("pasted, but sending submit failed: {e}"))
+        }
+        None => Err("nothing was pasted, so submit was not sent".to_string()),
+    }
+}
+
+/// Wait for the stop to take effect and the pipeline to return to idle.
+fn wait_for_pipeline(
+    rx: &Receiver<ControlEvent>,
+    stop_timeout: Duration,
+    pipeline_timeout: Duration,
+) -> Result<(), String> {
+    let stopped = wait_for_event(rx, &["recording-stopped", "idle"], stop_timeout)
+        .map_err(|_| "stop was not applied (no state change)".to_string())?;
+    if stopped.event == "idle" {
+        return Err("recording was cancelled before it was transcribed".to_string());
+    }
+    wait_for_event(rx, &["idle"], pipeline_timeout)
+        .map_err(|_| "timed out waiting for the transcription to finish".to_string())?;
+    Ok(())
+}
+
+fn wait_for_event(
+    rx: &Receiver<ControlEvent>,
+    names: &[&str],
+    timeout: Duration,
+) -> Result<ControlEvent, ()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(e) if names.contains(&e.event.as_str()) => return Ok(e),
+            Ok(_) => continue,
+            Err(_) => return Err(()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -195,28 +392,45 @@ fn handle_connection(stream: TcpStream, app: &AppHandle, token: &str) -> std::io
     let mut line = String::new();
     reader.read_line(&mut line)?;
 
-    let response = match serde_json::from_str::<Request>(line.trim()) {
+    let request = serde_json::from_str::<Request>(line.trim());
+
+    // `subscribe` keeps the connection open instead of sending one reply.
+    if let Ok(Request {
+        token: received,
+        command: ControlCommand::Subscribe,
+    }) = &request
+    {
+        if tokens_match(received, token) {
+            return serve_events(stream, app);
+        }
+    }
+
+    let response = match request {
         Ok(req) if tokens_match(&req.token, token) => match dispatch(app, req.command) {
-            Ok(message) => Response {
+            Ok(reply) => Response {
                 ok: true,
-                message: Some(message),
+                message: Some(reply.message),
                 error: None,
+                data: reply.data,
             },
             Err(error) => Response {
                 ok: false,
                 message: None,
                 error: Some(error),
+                data: None,
             },
         },
         Ok(_) => Response {
             ok: false,
             message: None,
             error: Some("authentication failed".to_string()),
+            data: None,
         },
         Err(e) => Response {
             ok: false,
             message: None,
             error: Some(format!("malformed request: {e}")),
+            data: None,
         },
     };
 
@@ -230,12 +444,83 @@ fn handle_connection(stream: TcpStream, app: &AppHandle, token: &str) -> std::io
     Ok(())
 }
 
+/// How often an idle event stream sends a `ping`, so a vanished client is
+/// noticed (the write fails) instead of pinning its thread until the next
+/// real event.
+const EVENT_KEEPALIVE: Duration = Duration::from_secs(30);
+
+/// Serve a `subscribe` connection: acknowledge with the current status, then
+/// write one [`ControlEvent`] JSON line per state change until the client goes
+/// away.
+fn serve_events(mut stream: TcpStream, app: &AppHandle) -> std::io::Result<()> {
+    stream.set_read_timeout(None)?;
+    // Subscribe before taking the snapshot so no change falls in the gap.
+    let rx = subscribe();
+    let snapshot = status_snapshot(app).map_err(std::io::Error::other)?;
+    let ack = Response {
+        ok: true,
+        message: Some("subscribed".to_string()),
+        error: None,
+        data: Some(snapshot),
+    };
+    write_line(&mut stream, &ack)?;
+
+    loop {
+        let event = match rx.recv_timeout(EVENT_KEEPALIVE) {
+            Ok(event) => event,
+            Err(RecvTimeoutError::Timeout) => {
+                let stage = current_stage(app);
+                ControlEvent::new("ping", stage)
+            }
+            Err(RecvTimeoutError::Disconnected) => return Ok(()),
+        };
+        write_line(&mut stream, &event)?;
+    }
+}
+
+fn write_line<T: Serialize>(stream: &mut TcpStream, value: &T) -> std::io::Result<()> {
+    let mut payload = serde_json::to_string(value).map_err(std::io::Error::other)?;
+    payload.push('\n');
+    stream.write_all(payload.as_bytes())?;
+    stream.flush()
+}
+
+fn current_stage(app: &AppHandle) -> PipelineStage {
+    app.try_state::<TranscriptionCoordinator>()
+        .map(|c| c.stage())
+        .unwrap_or(PipelineStage::Idle)
+}
+
+/// `{listening, stage, mic}`: `listening` is whether the microphone is
+/// recording right now, `stage` the pipeline stage (`idle` | `recording` |
+/// `processing`), `mic` the selected input device name (`null` = system
+/// default).
+fn status_snapshot(app: &AppHandle) -> Result<serde_json::Value, String> {
+    let rm = app
+        .try_state::<Arc<AudioRecordingManager>>()
+        .ok_or_else(|| "audio manager not initialized".to_string())?;
+    Ok(serde_json::json!({
+        "listening": rm.is_recording(),
+        "stage": current_stage(app).as_str(),
+        "mic": get_settings(app).selected_microphone,
+    }))
+}
+
 /// Apply a command to the running app. Returns a human-readable success message
 /// or an error string; the error is relayed verbatim to the CLI, which exits
 /// nonzero.
-fn dispatch(app: &AppHandle, command: ControlCommand) -> Result<String, String> {
+fn dispatch(app: &AppHandle, command: ControlCommand) -> Result<Reply, String> {
     match command {
-        ControlCommand::Listen { state } => {
+        ControlCommand::Status => {
+            let data = status_snapshot(app)?;
+            Ok(Reply {
+                message: data.to_string(),
+                data: Some(data),
+            })
+        }
+        // Handled in `handle_connection` before dispatch (it streams).
+        ControlCommand::Subscribe => Err("subscribe is a streaming command".to_string()),
+        ControlCommand::Listen { state, submit } => {
             let rm = app
                 .try_state::<Arc<AudioRecordingManager>>()
                 .ok_or_else(|| "audio manager not initialized".to_string())?;
@@ -253,12 +538,40 @@ fn dispatch(app: &AppHandle, command: ControlCommand) -> Result<String, String> 
                 ListenState::Toggle => (true, "listening started"),
             };
 
+            let stops = should_toggle && recording;
+            if submit && !stops {
+                return Err(if recording {
+                    "--submit only applies when stopping; listening is already on".to_string()
+                } else {
+                    "--submit needs an active recording to stop; nothing to submit".to_string()
+                });
+            }
+
+            if submit {
+                // Subscribe and arm the submit request before the stop press so
+                // neither the events nor the paste can slip past us.
+                let rx = subscribe();
+                if let Ok(mut slot) = SUBMIT_OUTCOME.lock() {
+                    *slot = None;
+                }
+                SUBMIT_REQUESTED.store(true, Ordering::SeqCst);
+                coordinator.send_input("transcribe", "CLI", true, false);
+                return await_submit(
+                    &rx,
+                    &SUBMIT_REQUESTED,
+                    &SUBMIT_OUTCOME,
+                    SUBMIT_STOP_TIMEOUT,
+                    SUBMIT_PIPELINE_TIMEOUT,
+                )
+                .map(Reply::message);
+            }
+
             if should_toggle {
                 // Mirror the signal/CLI toggle path: a single press event with
                 // push_to_talk = false flips the transcribe binding.
                 coordinator.send_input("transcribe", "CLI", true, false);
             }
-            Ok(message.to_string())
+            Ok(Reply::message(message))
         }
         ControlCommand::SetMicrophone { name } => {
             // Resolve the manager before touching persisted settings so a missing
@@ -286,7 +599,7 @@ fn dispatch(app: &AppHandle, command: ControlCommand) -> Result<String, String> 
                 return Err(format!("failed to apply device: {e}"));
             }
 
-            Ok(format!("microphone set to \"{name}\""))
+            Ok(Reply::message(format!("microphone set to \"{name}\"")))
         }
         ControlCommand::DownloadModel { id } => {
             let model_manager = app
@@ -300,7 +613,7 @@ fn dispatch(app: &AppHandle, command: ControlCommand) -> Result<String, String> 
             tauri::async_runtime::block_on(model_manager.download_model(&id))
                 .map_err(|e| format!("download failed: {e}"))?;
 
-            Ok(format!("model \"{id}\" downloaded"))
+            Ok(Reply::message(format!("model \"{id}\" downloaded")))
         }
     }
 }
@@ -524,6 +837,86 @@ pub fn run(command: &ControlCommand) -> i32 {
     }
 }
 
+/// Subscribe to the running app's state events and print each JSON line to
+/// stdout (flushed) until the app closes the connection. The first line is the
+/// acknowledgment carrying the current status.
+pub fn run_events() -> i32 {
+    crate::portable::init();
+
+    let (port, token) = match read_control_file() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: Handy does not appear to be running: {e}");
+            return EXIT_NOT_RUNNING;
+        }
+    };
+
+    let stream = match TcpStream::connect(("127.0.0.1", port)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "error: could not reach running Handy: could not connect on 127.0.0.1:{port}: {e}"
+            );
+            return EXIT_NOT_RUNNING;
+        }
+    };
+    let request = Request {
+        token,
+        command: ControlCommand::Subscribe,
+    };
+    let sent = serde_json::to_string(&request)
+        .map_err(|e| e.to_string())
+        .and_then(|mut payload| {
+            payload.push('\n');
+            let mut writer = &stream;
+            writer
+                .write_all(payload.as_bytes())
+                .and_then(|_| writer.flush())
+                .map_err(|e| e.to_string())
+        });
+    if let Err(e) = sent {
+        eprintln!("error: could not reach running Handy: send: {e}");
+        return EXIT_NOT_RUNNING;
+    }
+
+    let stdout = std::io::stdout();
+    let mut first = true;
+    for line in BufReader::new(stream).lines() {
+        let Ok(line) = line else {
+            break;
+        };
+        if first {
+            first = false;
+            match serde_json::from_str::<Response>(&line) {
+                Ok(resp) if resp.ok => {}
+                Ok(resp) => {
+                    eprintln!(
+                        "error: {}",
+                        resp.error.unwrap_or_else(|| "subscribe failed".to_string())
+                    );
+                    return EXIT_COMMAND_FAILED;
+                }
+                Err(e) => {
+                    eprintln!("error: malformed response: {e}");
+                    return EXIT_NOT_RUNNING;
+                }
+            }
+        }
+        let mut out = stdout.lock();
+        if writeln!(out, "{line}").and_then(|_| out.flush()).is_err() {
+            // Downstream (e.g. a closed pipe) went away; stop quietly.
+            return EXIT_OK;
+        }
+    }
+    // The app closed the stream (shutdown): that is not a command failure, but
+    // a consumer should know the feed ended.
+    if first {
+        EXIT_NOT_RUNNING
+    } else {
+        EXIT_OK
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,6 +925,7 @@ mod tests {
     fn control_command_round_trips_through_json() {
         let cmd = ControlCommand::Listen {
             state: ListenState::On,
+            submit: false,
         };
         let req = Request {
             token: "abc".to_string(),
@@ -541,12 +935,16 @@ mod tests {
         assert!(json.contains("\"action\":\"listen\""));
         assert!(json.contains("\"state\":\"on\""));
         assert!(json.contains("\"token\":\"abc\""));
+        // `submit: false` is omitted so the wire format is unchanged for plain
+        // `listen` requests.
+        assert!(!json.contains("submit"));
 
         let parsed: Request = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             parsed.command,
             ControlCommand::Listen {
-                state: ListenState::On
+                state: ListenState::On,
+                submit: false
             }
         ));
     }
@@ -628,8 +1026,267 @@ mod tests {
             "t".to_string(),
             &ControlCommand::Listen {
                 state: ListenState::Off,
+                submit: false,
             },
         );
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn listen_without_submit_field_still_parses() {
+        // What an older client sends: no `submit` key at all.
+        let parsed: Request =
+            serde_json::from_str(r#"{"token":"t","action":"listen","state":"off"}"#).unwrap();
+        assert!(matches!(
+            parsed.command,
+            ControlCommand::Listen {
+                state: ListenState::Off,
+                submit: false
+            }
+        ));
+    }
+
+    #[test]
+    fn listen_submit_and_new_actions_serialize() {
+        let json = serde_json::to_string(&Request {
+            token: "t".to_string(),
+            command: ControlCommand::Listen {
+                state: ListenState::Off,
+                submit: true,
+            },
+        })
+        .unwrap();
+        assert!(json.contains("\"submit\":true"));
+
+        for (cmd, action) in [
+            (ControlCommand::Status, "status"),
+            (ControlCommand::Subscribe, "subscribe"),
+        ] {
+            let json = serde_json::to_string(&Request {
+                token: "t".to_string(),
+                command: cmd,
+            })
+            .unwrap();
+            assert!(json.contains(&format!("\"action\":\"{action}\"")));
+        }
+    }
+
+    #[test]
+    fn response_data_is_omitted_when_absent_and_parsed_when_present() {
+        let plain = serde_json::to_string(&Response {
+            ok: true,
+            message: Some("m".to_string()),
+            error: None,
+            data: None,
+        })
+        .unwrap();
+        assert!(!plain.contains("data"));
+
+        let with_data: Response = serde_json::from_str(
+            r#"{"ok":true,"message":"x","data":{"listening":false,"stage":"idle","mic":null}}"#,
+        )
+        .unwrap();
+        let data = with_data.data.unwrap();
+        assert_eq!(data["stage"], "idle");
+        assert_eq!(data["listening"], false);
+        // Old-style responses (no `data`) still parse.
+        let old: Response = serde_json::from_str(r#"{"ok":true,"message":"x"}"#).unwrap();
+        assert!(old.data.is_none());
+    }
+
+    fn ev(name: &str, stage: PipelineStage) -> ControlEvent {
+        ControlEvent::new(name, stage)
+    }
+
+    #[test]
+    fn stage_changes_publish_events_in_order() {
+        let rx = subscribe();
+        publish_stage_change(PipelineStage::Recording);
+        publish_stage_change(PipelineStage::Processing);
+        publish_pasted();
+        publish_stage_change(PipelineStage::Idle);
+
+        let names: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|e| e.event)
+            .collect();
+        // Other tests share the global bus, so only assert our subsequence.
+        let wanted = [
+            "recording-started",
+            "recording-stopped",
+            "processing",
+            "pasted",
+            "idle",
+        ];
+        let mut it = names.iter();
+        for w in wanted {
+            assert!(it.any(|n| n == w), "missing {w} in {names:?}");
+        }
+    }
+
+    #[test]
+    fn event_serializes_with_stage_and_timestamp() {
+        let json = serde_json::to_string(&ev("idle", PipelineStage::Idle)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["event"], "idle");
+        assert_eq!(v["stage"], "idle");
+        assert!(v["ts"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn submit_succeeds_when_submit_key_was_sent() {
+        let (tx, rx) = mpsc::channel();
+        let pending = AtomicBool::new(true);
+        let outcome = Mutex::new(None);
+        tx.send(ev("recording-stopped", PipelineStage::Processing))
+            .unwrap();
+        tx.send(ev("processing", PipelineStage::Processing))
+            .unwrap();
+        pending.store(false, Ordering::SeqCst);
+        *outcome.lock().unwrap() = Some(SubmitOutcome::Sent);
+        tx.send(ev("pasted", PipelineStage::Processing)).unwrap();
+        tx.send(ev("idle", PipelineStage::Idle)).unwrap();
+
+        let out = await_submit(
+            &rx,
+            &pending,
+            &outcome,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        assert_eq!(out, Ok("listening stopped; pasted and submitted"));
+    }
+
+    #[test]
+    fn submit_fails_and_clears_request_when_nothing_was_pasted() {
+        let (tx, rx) = mpsc::channel();
+        let pending = AtomicBool::new(true);
+        let outcome = Mutex::new(None);
+        tx.send(ev("recording-stopped", PipelineStage::Processing))
+            .unwrap();
+        tx.send(ev("idle", PipelineStage::Idle)).unwrap();
+
+        let out = await_submit(
+            &rx,
+            &pending,
+            &outcome,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        assert!(out.unwrap_err().contains("nothing was pasted"));
+        assert!(
+            !pending.load(Ordering::SeqCst),
+            "an unconsumed request must not leak into the next paste"
+        );
+    }
+
+    #[test]
+    fn submit_reports_cancellation_and_clears_request() {
+        let (tx, rx) = mpsc::channel();
+        let pending = AtomicBool::new(true);
+        let outcome = Mutex::new(None);
+        tx.send(ev("idle", PipelineStage::Idle)).unwrap();
+
+        let out = await_submit(
+            &rx,
+            &pending,
+            &outcome,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        assert!(out.unwrap_err().contains("cancelled"));
+        assert!(!pending.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn submit_times_out_when_stop_never_happens() {
+        let (_tx, rx) = mpsc::channel::<ControlEvent>();
+        let pending = AtomicBool::new(true);
+        let outcome = Mutex::new(None);
+
+        let out = await_submit(
+            &rx,
+            &pending,
+            &outcome,
+            Duration::from_millis(30),
+            Duration::from_millis(30),
+        );
+        assert!(out.unwrap_err().contains("stop was not applied"));
+        assert!(!pending.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn submit_times_out_when_pipeline_never_finishes() {
+        let (tx, rx) = mpsc::channel();
+        let pending = AtomicBool::new(true);
+        let outcome = Mutex::new(None);
+        tx.send(ev("recording-stopped", PipelineStage::Processing))
+            .unwrap();
+
+        let out = await_submit(
+            &rx,
+            &pending,
+            &outcome,
+            Duration::from_secs(1),
+            Duration::from_millis(30),
+        );
+        assert!(out.unwrap_err().contains("timed out"));
+        assert!(!pending.load(Ordering::SeqCst));
+    }
+
+    fn run_with_outcome(o: Option<SubmitOutcome>) -> (Result<&'static str, String>, bool) {
+        let (tx, rx) = mpsc::channel();
+        let pending = AtomicBool::new(true);
+        let outcome = Mutex::new(o);
+        tx.send(ev("recording-stopped", PipelineStage::Processing))
+            .unwrap();
+        tx.send(ev("idle", PipelineStage::Idle)).unwrap();
+        let out = await_submit(
+            &rx,
+            &pending,
+            &outcome,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        let cleared = outcome.lock().unwrap().is_none();
+        (out, cleared)
+    }
+
+    #[test]
+    fn submit_errors_when_paste_failed() {
+        let (out, cleared) = run_with_outcome(Some(SubmitOutcome::PasteFailed("boom".into())));
+        let err = out.unwrap_err();
+        assert!(err.contains("paste failed") && err.contains("boom"));
+        assert!(cleared);
+    }
+
+    #[test]
+    fn submit_errors_when_enter_send_failed() {
+        let (out, cleared) = run_with_outcome(Some(SubmitOutcome::SendFailed("nokey".into())));
+        let err = out.unwrap_err();
+        assert!(err.contains("submit failed") && err.contains("nokey"));
+        assert!(cleared);
+    }
+
+    #[test]
+    fn submit_reports_queued_for_reliable_paste() {
+        let (out, _) = run_with_outcome(Some(SubmitOutcome::Queued));
+        assert_eq!(out, Ok("listening stopped; pasted, submit queued"));
+    }
+
+    #[test]
+    fn first_recorded_submit_outcome_wins() {
+        let slot = Mutex::new(None);
+        slot.lock().unwrap().get_or_insert(SubmitOutcome::Sent);
+        slot.lock()
+            .unwrap()
+            .get_or_insert(SubmitOutcome::PasteFailed("late".into()));
+        assert_eq!(*slot.lock().unwrap(), Some(SubmitOutcome::Sent));
+    }
+
+    #[test]
+    fn take_submit_request_is_one_shot() {
+        SUBMIT_REQUESTED.store(true, Ordering::SeqCst);
+        assert!(take_submit_request());
+        assert!(!take_submit_request());
     }
 }
